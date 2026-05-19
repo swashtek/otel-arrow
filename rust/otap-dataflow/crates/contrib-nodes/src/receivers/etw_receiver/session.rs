@@ -27,12 +27,11 @@
 //!
 //! ## Integration with `one_collect`
 //!
-//! Instead of using the low-level `set_raw_event_callback` (which bypasses
-//! `one_collect`'s event routing), we register a catch-all `Event` per
-//! provider via [`EtwSession::add_event`].  This fires for every event from
-//! a given provider GUID, regardless of event ID.  Header metadata (PID,
-//! TID, timestamp, etc.) is read from the session's [`AncillaryData`] which
-//! `one_collect` populates before each dispatch.
+//! We use `set_raw_event_callback` to receive every `EVENT_RECORD` from
+//! `ProcessTrace`.  This is the only catch-all API — `add_event` only
+//! matches a specific event ID, not all events from a provider.  The
+//! callback extracts header fields directly from the `EVENT_RECORD` and
+//! round-robins the resulting `EtwEventData` across the per-core channels.
 //!
 //! ## Lifecycle
 //!
@@ -41,8 +40,6 @@
 //! events to the remaining senders.  When **all** senders have been dropped
 //! (i.e. no receivers remain) the callback becomes a no-op.
 
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::Mutex;
 
 use one_collect::Guid;
@@ -195,9 +192,8 @@ static SESSION: Mutex<Option<Vec<mpsc::Receiver<EtwEventData>>>> = Mutex::new(No
 /// This function:
 /// 1. Creates an `EtwSession`.
 /// 2. Enables each configured provider.
-/// 3. Registers a **provider-wide event** (catch-all) per provider that uses
-///    `AncillaryData` to extract header fields and round-robins the resulting
-///    `EtwEventData` across the N senders.
+/// 3. Installs a raw event callback that reads directly from `EVENT_RECORD`
+///    and round-robins the resulting `EtwEventData` across the N senders.
 /// 4. Calls `parse_until` which blocks until the process exits.
 fn spawn_etw_session(config: &Config, txs: Vec<mpsc::Sender<EtwEventData>>) -> Result<(), Error> {
     // Resolve all provider GUIDs up-front so configuration errors are
@@ -229,73 +225,33 @@ fn spawn_etw_session(config: &Config, txs: Vec<mpsc::Sender<EtwEventData>>) -> R
                 }
             }
 
-            // Obtain the ancillary data handle.  `one_collect` populates this
-            // with the current EVENT_RECORD's header fields (PID, TID,
-            // timestamp, provider GUID, etc.) before dispatching each event.
-            let ancillary = session.ancillary_data();
+            // Round-robin counter for fan-out across per-core channels.
+            // `set_raw_event_callback` takes `FnMut`, so a plain `usize`
+            // suffices (no atomics or interior mutability needed).
+            let mut next: usize = 0;
+            let num_txs = txs.len();
 
-            // Shared round-robin counter and sender list.  All provider
-            // callbacks run on the single `ProcessTrace` thread, so `Cell`
-            // is safe — no atomics or locking needed.  Sharing the counter
-            // ensures uniform core distribution even at startup when
-            // multiple providers would otherwise all start at index 0.
-            let next: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-            let txs: Rc<Vec<mpsc::Sender<EtwEventData>>> = Rc::new(txs);
-
-            // Register a provider-wide event for each configured provider.
-            // A "wide event" fires for ALL event IDs from the provider,
-            // unlike `add_event` which only fires for a specific event ID.
-            for (guid, level, keywords) in &resolved_providers {
-                let mut wide_event = one_collect::event::Event::new(0, "otap_wide".to_string());
-                {
-                    let ext = wide_event.extension_mut();
-                    *ext.provider_mut() = *guid;
-                    *ext.level_mut() = *level;
-                    *ext.keyword_mut() = keywords.unwrap_or(0);
-                }
-
-                let ancillary = ancillary.clone();
-                let next = Rc::clone(&next);
-                let txs = Rc::clone(&txs);
-
-                wide_event.add_callback(move |_event_data| {
-                    // Read header metadata from AncillaryData (populated
-                    // by one_collect before each dispatch).
-                    let anc = ancillary.borrow();
-
-                    // Build EtwEventData from AncillaryData.
-                    // PID, TID, timestamp, provider, and opcode are
-                    // available directly; event_id/version/level/keywords
-                    // come from the full_data bytes passed via EventData.
-                    let data = EtwEventData {
-                        provider_id: anc.provider().to_bytes(),
-                        timestamp: anc.time(),
-                        process_id: anc.pid(),
-                        thread_id: anc.tid(),
-                        // TODO: populate event_id/opcode/level/keywords/version
-                        // once WindowsEventExtension exposes EVENT_DESCRIPTOR.
-                        event_id: 0,
-                        opcode: 0,
-                        version: 0,
-                        level: 0,
-                        keywords: 0,
-                    };
-
-                    // Drop the borrow before sending.
-                    drop(anc);
-
-                    let i = next.get();
-                    next.set(i.wrapping_add(1));
-
-                    // Best-effort send; if this core's channel is full,
-                    // drop the event for that core only.
-                    let _ = txs[i % txs.len()].try_send(data);
-
-                    Ok(())
-                });
-
-                session.add_event(wide_event, None);
-            }
+            // `set_raw_event_callback` is the catch-all API: it receives
+            // every EVENT_RECORD from ProcessTrace regardless of provider
+            // or event ID.  We read header fields directly from the
+            // EVENT_RECORD, giving us full event metadata.
+            session.set_raw_event_callback(move |event| {
+                let data = EtwEventData {
+                    provider_id: event.EventHeader.ProviderId.to_bytes(),
+                    timestamp: event.EventHeader.TimeStamp,
+                    process_id: event.EventHeader.ProcessId,
+                    thread_id: event.EventHeader.ThreadId,
+                    event_id: event.EventHeader.EventDescriptor.Id,
+                    opcode: event.EventHeader.EventDescriptor.Opcode,
+                    version: event.EventHeader.EventDescriptor.Version,
+                    level: event.EventHeader.EventDescriptor.Level,
+                    keywords: event.EventHeader.EventDescriptor.Keyword,
+                };
+                // Best-effort send; if this core's channel is full,
+                // drop the event for that core only.
+                let _ = txs[next % num_txs].try_send(data);
+                next = next.wrapping_add(1);
+            });
 
             // `parse_until` blocks on `ProcessTrace`.  We never signal stop,
             // so the session runs until the process exits.
