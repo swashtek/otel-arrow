@@ -21,6 +21,8 @@
 //! * `receiver.etw.events.received`: Ingress denominator, counted in the ETW event callback before channel enqueue.
 //! * `receiver.etw.events.forwarded`: Events handed off to the next pipeline stage in batches.
 //! * `receiver.etw.decode.errors`: TDH decoding failures. Events that fail decoding are still forwarded with empty fields where possible.
+//! * `receiver.etw.decode.manifest.events`: EventSource in-band manifest chunk events consumed as schema metadata. They are **not** log records, are never forwarded, and are excluded from `events.received`.
+//! * `receiver.etw.decode.manifest.errors`: EventSource manifest ingestion problems (invalid envelopes, malformed manifests, orphan chunks, abandoned partial manifests). Affected providers' events count as `decode.errors` until a manifest is received.
 //! * `receiver.etw.session.events.lost`: Kernel buffer overrun before the receiver saw the events.
 //! * `receiver.etw.session.buffers.written`: Kernel buffers written by the session.
 //! * `receiver.etw.session.buffers.lost`: Kernel buffers lost, split by `delivery="real_time"` vs `delivery="log_file"`.
@@ -64,6 +66,16 @@ pub(super) struct EtwDecodeMetrics {
     /// Note that these events remain eligible for forwarding downstream with empty decoded fields.
     #[metric(unit = "{event}")]
     pub(super) errors: Counter<u64>,
+
+    /// EventSource in-band manifest chunk events consumed as schema metadata.
+    /// These are never forwarded and are not counted in `events.received`.
+    #[metric(unit = "{event}")]
+    pub(super) manifest_events: Counter<u64>,
+
+    /// EventSource in-band manifest ingestion problems (invalid envelopes,
+    /// malformed manifests, orphan chunks, abandoned partial manifests).
+    #[metric(unit = "{error}")]
+    pub(super) manifest_errors: Counter<u64>,
 }
 
 /// Reason an ETW event was dropped.
@@ -589,6 +601,18 @@ mod tests {
                 instrument: "errors",
                 attr: None,
                 value: 2,
+            },
+            KeyedObservation {
+                scope: "receiver.etw.decode",
+                instrument: "manifest.events",
+                attr: None,
+                value: 0,
+            },
+            KeyedObservation {
+                scope: "receiver.etw.decode",
+                instrument: "manifest.errors",
+                attr: None,
+                value: 0,
             },
             KeyedObservation {
                 scope: "receiver.etw.session",

@@ -317,6 +317,9 @@ tracepoint.workspace = true
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 tracelogging.workspace = true
 tracelogging_dynamic.workspace = true
+# ETW `EventRegister`/`EventWrite`, used by the ETW receiver e2e test to emit
+# .NET EventSource-protocol in-band manifest events without a .NET dependency.
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Etw"] }
 
 [[bench]]
 name = "azure_monitor_transformer"

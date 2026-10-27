@@ -21,6 +21,10 @@ pub(crate) enum TracefsFieldLocation {
     DynRelative,
     DynAbsolute,
     StaticLenPrefixArray,
+    /// Byte array prefixed by a little-endian `u32` byte count. Mirrors
+    /// one_collect's `LocationType::StaticLenPrefix32Array`; tracefs formats
+    /// do not currently produce it.
+    StaticLenPrefix32Array,
     StaticUtf16String,
 }
 

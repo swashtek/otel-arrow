@@ -1,0 +1,8 @@
+change_type: enhancement
+component: pipeline
+note: >-
+  ETW receiver now decodes manifest-mode .NET EventSource providers from the manifest they emit in-band, without OS manifest registration.
+# TODO: replace with the otel-arrow PR number (333 is microsoft/one-collect#333).
+issues: [333]
+subtext: >-
+  EventSource manifest chunk events are no longer forwarded as empty log records or counted in receiver.etw.decode.errors; they are counted in receiver.etw.decode.manifest.events (ingestion problems in receiver.etw.decode.manifest.errors).

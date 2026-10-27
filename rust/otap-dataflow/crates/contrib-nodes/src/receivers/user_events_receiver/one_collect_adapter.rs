@@ -248,6 +248,9 @@ impl OneCollectUserEventsSession {
                             LocationType::StaticLenPrefixArray => {
                                 TracefsFieldLocation::StaticLenPrefixArray
                             }
+                            LocationType::StaticLenPrefix32Array => {
+                                TracefsFieldLocation::StaticLenPrefix32Array
+                            }
                             LocationType::StaticUTF16String => {
                                 TracefsFieldLocation::StaticUtf16String
                             }

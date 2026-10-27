@@ -7,16 +7,18 @@
 //! providers, emit TraceLogging events through both the dynamic
 //! (`tracelogging_dynamic`) and static (`tracelogging`) producer crates,
 //! and validate that the receiver decodes them into OTAP Arrow records
-//! with the expected structure and values.
+//! with the expected structure and values. A second test emulates a .NET
+//! manifest-mode `EventSource` (in-band manifest chunks + payload events)
+//! and validates in-band manifest decoding.
 //!
 //! The tests are `#[ignore]` because they require Administrator privileges
-//! and create a real-time ETW kernel session. Run locally from an elevated
+//! and create a real-time ETW kernel session. They share one ETW session
+//! GUID, so run them one at a time. Run locally from an elevated
 //! PowerShell:
 //!
 //! ```pwsh
 //! cargo test -p otel-arrow-dfe-contrib-nodes --features etw `
-//!     etw_receiver_decodes_tracelogging_events_end_to_end `
-//!     -- --ignored --nocapture
+//!     etw_receiver_decodes_ -- --ignored --nocapture --test-threads=1
 //! ```
 
 use super::*;
@@ -1337,5 +1339,393 @@ fn cleanup_stale_otap_etw_sessions() {
                 eprintln!("failed to invoke `logman stop {name}`: {e}");
             }
         }
+    }
+}
+
+// -- EventSource in-band manifest ----------------------------------------
+//
+// Manifest-mode .NET `EventSource` providers emit their manifest in-band as
+// chunked `Id 0xFFFE / Opcode 0xFE / Task 0xFFFE` events. This test emulates
+// that protocol with raw `EventRegister`/`EventWrite` (exactly the bytes
+// `EventSource.SendManifest` writes), so it needs no .NET runtime.
+
+const ES_SCALARS_EVENT: &str = "EsScalars";
+const ES_BLOB_EVENT: &str = "EsBlob";
+const ES_PING_EVENT: &str = "EsPing";
+const ES_MIXED_TL_EVENT: &str = "EsMixedTl";
+/// `EVENT_DESCRIPTOR.Id` of EventSource manifest chunk events.
+const ES_MANIFEST_EVENT_ID: i64 = 0xFFFE;
+
+/// Scenario: A GUID-only subscription to a manifest-mode EventSource
+/// provider that is not registered with the OS receives the in-band
+/// manifest, its payload events, and a self-describing (TraceLogging) event
+/// under the same provider GUID.
+/// Guarantees: Payload events are decoded from the in-band manifest (event
+/// name from `symbol`, typed attributes including `byte[]`), the provider
+/// name is learned from the manifest, the TraceLogging event still decodes,
+/// and no manifest chunk is forwarded as a log record.
+#[test]
+#[ignore = "requires Administrator privileges and creates a real ETW kernel session; run explicitly with `-- --ignored`"]
+fn etw_receiver_decodes_eventsource_inband_manifest_end_to_end() {
+    assert!(
+        is_process_elevated(),
+        "ETW receiver e2e test requires Administrator privileges."
+    );
+
+    let pid = std::process::id();
+    let provider_name = format!("OtapEtwE2E.EventSource.{pid}");
+    // Distinct from the TraceLogging test's session name: sessions live in a
+    // process-global registry until the process exits.
+    let session_name = format!("OtapEtwE2E-ES-{pid}");
+    cleanup_stale_otap_etw_sessions();
+
+    // GUID-only and unregistered: the provider name can only come from the
+    // in-band manifest.
+    let provider_guid = one_collect::guid_from_provider_name(&provider_name);
+    let config_json = serde_json::json!({
+        "session_name": session_name,
+        "providers": [
+            { "guid": session::CanonicalGuid::from(provider_guid).to_string(), "level": "verbose" },
+        ],
+    });
+
+    let (pipeline_ctx, _registry) = test_pipeline_ctx();
+    let receiver = EtwReceiver::from_config(pipeline_ctx, &config_json)
+        .expect("EtwReceiver::from_config should succeed (Administrator required)");
+
+    let test_runtime = TestRuntime::<OtapPdata>::new();
+    let node_config = Arc::new(NodeUserConfig::new_receiver_config(ETW_RECEIVER_URN));
+    let receiver_wrapper = ReceiverWrapper::local(
+        receiver,
+        test_node(test_runtime.config().name.clone()),
+        node_config,
+        test_runtime.config(),
+    );
+
+    let producer_name = provider_name.clone();
+    test_runtime
+        .set_receiver(receiver_wrapper)
+        .run_test(move |ctx| {
+            Box::pin(run_then_shutdown(ctx, async move {
+                run_eventsource_producer(&producer_name).await;
+            })) as Pin<Box<dyn Future<Output = ()>>>
+        })
+        .run_validation(eventsource_validation(provider_name));
+}
+
+/// Runs `body`, then always sends `DrainIngress` + `Shutdown` (re-raising a
+/// panic from `body` afterwards) so a failed assertion cannot leave the
+/// receiver running and hang validation.
+async fn run_then_shutdown(
+    ctx: otel_arrow_dfe_engine::testing::receiver::TestContext<OtapPdata>,
+    body: impl Future<Output = ()>,
+) {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let outcome = AssertUnwindSafe(body).catch_unwind().await;
+
+    let _ = ctx
+        .send_control_msg(NodeControlMsg::DrainIngress {
+            deadline: Instant::now() + Duration::from_secs(5),
+            reason: "Test drain".to_owned(),
+        })
+        .await;
+    let _ = ctx.send_shutdown(Instant::now(), "Test").await;
+
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A manifest in the exact shape `EventSource`'s `ManifestBuilder` emits:
+/// `symbol` names, a parameterless event without `template`, and `byte[]`
+/// as a `<name>Size` u32 followed by `win:Binary length="<name>Size"`.
+fn eventsource_manifest(provider_name: &str, provider_guid: &str) -> String {
+    format!(
+        r#"<instrumentationManifest xmlns="http://schemas.microsoft.com/win/2004/08/events">
+ <instrumentation xmlns:win="http://manifests.microsoft.com/win/2004/08/windows/events">
+  <events xmlns="http://schemas.microsoft.com/win/2004/08/events">
+<provider name="{provider_name}" guid="{{{provider_guid}}}" symbol="OtapEtwE2EEventSource">
+ <tasks>
+  <task name="{ES_SCALARS_EVENT}" value="65533"/>
+  <task name="{ES_BLOB_EVENT}" value="65532"/>
+  <task name="{ES_PING_EVENT}" value="65531"/>
+ </tasks>
+ <events>
+  <event value="1" version="0" level="win:Informational" symbol="{ES_SCALARS_EVENT}" task="{ES_SCALARS_EVENT}" template="{ES_SCALARS_EVENT}Args"/>
+  <event value="2" version="0" level="win:Informational" symbol="{ES_BLOB_EVENT}" task="{ES_BLOB_EVENT}" template="{ES_BLOB_EVENT}Args"/>
+  <event value="3" version="0" level="win:Informational" symbol="{ES_PING_EVENT}" task="{ES_PING_EVENT}"/>
+ </events>
+ <templates>
+  <template tid="{ES_SCALARS_EVENT}Args">
+   <data name="Count" inType="win:Int32"/>
+   <data name="Big" inType="win:UInt64"/>
+   <data name="Ratio" inType="win:Double"/>
+   <data name="Flag" inType="win:Boolean"/>
+   <data name="Message" inType="win:UnicodeString"/>
+   <data name="After" inType="win:Int32"/>
+  </template>
+  <template tid="{ES_BLOB_EVENT}Args">
+   <data name="before" inType="win:Int32"/>
+   <data name="dataSize" inType="win:UInt32"/>
+   <data name="data" inType="win:Binary" length="dataSize"/>
+   <data name="after" inType="win:Int32"/>
+  </template>
+ </templates>
+</provider>
+</events>
+</instrumentation>
+</instrumentationManifest>"#
+    )
+}
+
+/// Raw ETW registration that writes EventSource-protocol events.
+struct EventSourceEmitter {
+    handle: i64,
+}
+
+impl EventSourceEmitter {
+    #[allow(unsafe_code)]
+    fn register(guid: one_collect::Guid) -> Self {
+        use windows_sys::Win32::System::Diagnostics::Etw::EventRegister;
+
+        let guid = windows_sys::core::GUID {
+            data1: guid.data1,
+            data2: guid.data2,
+            data3: guid.data3,
+            data4: guid.data4,
+        };
+        let mut handle: i64 = 0;
+        // SAFETY: `guid` and `handle` outlive the call; no enable callback.
+        let status = unsafe { EventRegister(&guid, None, std::ptr::null(), &mut handle) };
+        assert_eq!(status, 0, "EventRegister returned {status}");
+        Self { handle }
+    }
+
+    #[allow(unsafe_code)]
+    fn write(&self, id: u16, level: u8, opcode: u8, task: u16, keyword: u64, payload: &[u8]) {
+        use windows_sys::Win32::System::Diagnostics::Etw::{
+            EVENT_DATA_DESCRIPTOR, EVENT_DESCRIPTOR, EventWrite,
+        };
+
+        let desc = EVENT_DESCRIPTOR {
+            Id: id,
+            Version: if id == 0xFFFE { 1 } else { 0 },
+            Channel: 0,
+            Level: level,
+            Opcode: opcode,
+            Task: task,
+            Keyword: keyword,
+        };
+        let data = EVENT_DATA_DESCRIPTOR {
+            Ptr: payload.as_ptr() as u64,
+            Size: payload.len() as u32,
+            // SAFETY: the reserved union must be zero-initialised.
+            Anonymous: unsafe { std::mem::zeroed() },
+        };
+        // SAFETY: live registration; `desc`, `data` and `payload` outlive
+        // the call.
+        let status = unsafe { EventWrite(self.handle, &desc, 1, &data) };
+        assert_eq!(status, 0, "EventWrite(id={id}) returned {status}");
+    }
+
+    /// Writes `manifest` exactly as `EventSource.SendManifest` does: one
+    /// event per chunk, each prefixed by the 8-byte `ManifestEnvelope`.
+    fn write_manifest(&self, manifest: &[u8], chunk_size: usize) {
+        let total = manifest.len().div_ceil(chunk_size) as u16;
+        for (n, chunk) in manifest.chunks(chunk_size).enumerate() {
+            let mut payload = vec![1u8, 1, 0, 0x5B];
+            payload.extend_from_slice(&total.to_le_bytes());
+            payload.extend_from_slice(&(n as u16).to_le_bytes());
+            payload.extend_from_slice(chunk);
+            self.write(0xFFFE, 0, 0xFE, 0xFFFE, 0x00FF_FFFF_FFFF_FFFF, &payload);
+        }
+    }
+
+    /// Writes a payload event the way EventSource does (Informational).
+    fn write_event(&self, id: u16, task: u16, payload: &[u8]) {
+        self.write(id, 4, 0, task, 0xF000_0000_0000, payload);
+    }
+}
+
+impl Drop for EventSourceEmitter {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: `handle` came from a successful `EventRegister`.
+        let _ =
+            unsafe { windows_sys::Win32::System::Diagnostics::Etw::EventUnregister(self.handle) };
+    }
+}
+
+fn utf16z(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+async fn run_eventsource_producer(provider_name: &str) {
+    let provider_guid = one_collect::guid_from_provider_name(provider_name);
+
+    // A TraceLogging registration under the same name has the same GUID
+    // (the EventSource name hash); it doubles as the "is enabled" probe and
+    // writes the mixed-mode self-describing event.
+    let tl_provider = Box::pin(tld::Provider::new(provider_name, &tld::Provider::options()));
+    // SAFETY: pinned for the rest of this function; unregisters on drop.
+    #[allow(unsafe_code)]
+    let r = unsafe { tl_provider.as_ref().register() };
+    assert_eq!(r, 0, "tld Provider::register returned errno {r}");
+    let emitter = EventSourceEmitter::register(provider_guid);
+
+    wait_until_enabled(
+        || tl_provider.enabled(tld::Level::Verbose, 0),
+        provider_name,
+    )
+    .await;
+
+    let manifest = eventsource_manifest(
+        provider_name,
+        &session::CanonicalGuid::from(provider_guid).to_string(),
+    );
+
+    let mut scalars = Vec::new();
+    scalars.extend_from_slice(&(-7i32).to_le_bytes());
+    scalars.extend_from_slice(&1_000_000_000_001u64.to_le_bytes());
+    scalars.extend_from_slice(&2.5f64.to_le_bytes());
+    scalars.extend_from_slice(&1i32.to_le_bytes()); // win:Boolean (4-byte BOOL)
+    scalars.extend(utf16z("hello-eventsource"));
+    scalars.extend_from_slice(&77i32.to_le_bytes());
+
+    let mut blob = 7i32.to_le_bytes().to_vec();
+    blob.extend_from_slice(&5u32.to_le_bytes());
+    blob.extend_from_slice(&[1, 2, 3, 4, 5]);
+    blob.extend_from_slice(&9i32.to_le_bytes());
+
+    // Like EventSource on enable: manifest first (several 512-byte chunks),
+    // then payload events. Repeated a few times (identical re-sends, as
+    // EventSource does on every enable) to tolerate startup races.
+    for _ in 0..3 {
+        emitter.write_manifest(manifest.as_bytes(), 512);
+        emitter.write_event(1, 65533, &scalars);
+        emitter.write_event(2, 65532, &blob);
+        emitter.write_event(3, 65531, &[]);
+        let r = tld::EventBuilder::new()
+            .reset(ES_MIXED_TL_EVENT, tld::Level::Informational, 0x1, 0)
+            .add_i32("Value", 4242, tld::OutType::Default, 0)
+            .write(&tl_provider, None, None);
+        assert_eq!(r, 0, "tld EventBuilder::write returned errno {r}");
+        time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Allow the kernel flush timer and the receiver's batch timer to run.
+    time::sleep(Duration::from_secs(5)).await;
+}
+
+fn eventsource_validation(
+    provider_name: String,
+) -> impl FnOnce(
+    otel_arrow_dfe_engine::testing::receiver::NotSendValidateContext<OtapPdata>,
+) -> Pin<Box<dyn Future<Output = ()>>> {
+    move |mut ctx| {
+        Box::pin(async move {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut batches: Vec<OtapArrowRecords> = Vec::new();
+            let our_pid = std::process::id();
+            let expected = [
+                ES_SCALARS_EVENT,
+                ES_BLOB_EVENT,
+                ES_PING_EVENT,
+                ES_MIXED_TL_EVENT,
+            ];
+
+            while Instant::now() < deadline
+                && !expected.iter().all(|e| has_event(&batches, e, our_pid))
+            {
+                if let Ok(Ok(pdata)) = time::timeout(Duration::from_millis(500), ctx.recv()).await {
+                    let records = pdata
+                        .payload_ref()
+                        .otap_ref()
+                        .expect("expected native OTAP payload from ETW receiver");
+                    batches.push(records.clone());
+                }
+            }
+
+            let provider_id =
+                session::CanonicalGuid::from(one_collect::guid_from_provider_name(&provider_name))
+                    .to_string();
+
+            // In-band manifest events: event id, provider identity (name
+            // learned from the manifest), and typed attributes.
+            let check_inband = |event: &str, event_id: i64| {
+                let (records, row) = locate_event(&batches, event, our_pid);
+                let attrs = collect_attributes(
+                    records.get(ArrowPayloadType::LogAttrs).expect("LogAttrs"),
+                    u16_column(
+                        records.get(ArrowPayloadType::Logs).expect("Logs"),
+                        consts::ID,
+                    )[row]
+                        .expect("log id"),
+                );
+                assert_attr_int(&attrs, "etw.event.id", event_id);
+                assert_attr_str(&attrs, "etw.provider.id", &provider_id);
+                assert_attr_str(&attrs, "etw.provider.name", &provider_name);
+                collect_user_attrs(records, row)
+            };
+
+            let attrs = check_inband(ES_SCALARS_EVENT, 1);
+            assert_attr_int(&attrs, "Count", -7);
+            assert_attr_int(&attrs, "Big", 1_000_000_000_001);
+            assert_attr_double(&attrs, "Ratio", 2.5);
+            assert_attr_int(&attrs, "Flag", 1);
+            assert_attr_str(&attrs, "Message", "hello-eventsource");
+            assert_attr_int(&attrs, "After", 77);
+
+            let attrs = check_inband(ES_BLOB_EVENT, 2);
+            assert_attr_int(&attrs, "before", 7);
+            // `byte[]` decodes to Bytes, which the encoder renders as hex.
+            assert_attr_str(&attrs, "data", "0102030405");
+            assert_attr_int(&attrs, "after", 9);
+            assert!(
+                !attrs.iter().any(|(k, _)| k == "dataSize"),
+                "the byte[] length field is folded into `data`"
+            );
+
+            let attrs = check_inband(ES_PING_EVENT, 3);
+            assert!(
+                attrs.is_empty(),
+                "parameterless event has no attributes: {attrs:?}"
+            );
+
+            // Mixed mode: the self-describing event under the same GUID.
+            let (records, row) = locate_event(&batches, ES_MIXED_TL_EVENT, our_pid);
+            assert_attr_int(&collect_user_attrs(records, row), "Value", 4242);
+
+            // Manifest chunks are metadata and must never be forwarded.
+            let forwarded_chunks = batches
+                .iter()
+                .flat_map(|records| {
+                    let logs = records.get(ArrowPayloadType::Logs);
+                    let attrs = records.get(ArrowPayloadType::LogAttrs);
+                    logs.zip(attrs)
+                        .map(|(logs, attrs)| {
+                            u16_column(logs, consts::ID)
+                                .into_iter()
+                                .flatten()
+                                .map(|id| collect_attributes(attrs, id))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .filter(|attrs| {
+                    attrs.iter().any(|(k, v)| {
+                        k == "etw.event.id" && *v == AttrSnapshot::Int(ES_MANIFEST_EVENT_ID)
+                    })
+                })
+                .count();
+            assert_eq!(
+                forwarded_chunks, 0,
+                "manifest chunk events must not be forwarded"
+            );
+        })
     }
 }

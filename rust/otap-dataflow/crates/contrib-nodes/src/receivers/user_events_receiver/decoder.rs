@@ -282,6 +282,13 @@ fn tracefs_field_bytes<'a>(field: &TracefsField, event_data: &'a [u8]) -> Option
             let end = len_end.checked_add(bytes_len)?;
             event_data.get(len_end..end)
         }
+        TracefsFieldLocation::StaticLenPrefix32Array => {
+            let len_end = field.offset.checked_add(4)?;
+            let len_bytes = event_data.get(field.offset..len_end)?;
+            let len = usize::try_from(u32::from_le_bytes(len_bytes.try_into().ok()?)).ok()?;
+            let end = len_end.checked_add(len)?;
+            event_data.get(len_end..end)
+        }
         TracefsFieldLocation::DynAbsolute | TracefsFieldLocation::DynRelative => {
             if field.size != 4 {
                 return None;
@@ -543,6 +550,34 @@ mod tests {
         assert_eq!(decoded.attributes[0].1, DecodedAttrValue::Int(200));
         assert_eq!(decoded.attributes[1].0, "endpoint");
         assert_eq!(decoded.attributes[1].1, "/checkout");
+    }
+
+    #[test]
+    fn tracefs_field_bytes_reads_u32_length_prefixed_array() {
+        let blob = field(
+            "blob",
+            "binary",
+            TracefsFieldLocation::StaticLenPrefix32Array,
+            8,
+            0,
+        );
+
+        let mut data = vec![0; 8];
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            tracefs_field_bytes(&blob, &data),
+            Some(&[0xAA, 0xBB, 0xCC][..])
+        );
+
+        // Length past the end of the payload.
+        let mut overlong = vec![0; 8];
+        overlong.extend_from_slice(&10u32.to_le_bytes());
+        overlong.push(1);
+        assert_eq!(tracefs_field_bytes(&blob, &overlong), None);
+
+        // Truncated length prefix.
+        assert_eq!(tracefs_field_bytes(&blob, &[0; 10]), None);
     }
 
     #[test]

@@ -39,14 +39,23 @@
 //! provider database, and TraceLogging / `EventSource` providers fall back to
 //! the standard name-hash convention. Set `kind: manifest` to require a
 //! registered provider, or `kind: tracelogging` to derive the GUID from the
-//! name without any OS lookup.
+//! name without any OS lookup. The name hash applies to `EventSource`
+//! providers in both self-describing and manifest mode.
+//!
+//! Manifest-mode .NET `EventSource` providers are decoded from the manifest
+//! they emit in-band (no OS registration needed). The manifest is written at
+//! level `LogAlways` with keywords `0x00FF_FFFF_FFFF_FFFF`, so it is delivered
+//! at any configured `level` and for any `keywords` mask except one that only
+//! uses the top eight (channel) bits. It is sent when the session enables the
+//! provider; if ETW loses those events, payload events stay undecoded (and
+//! count as `decode.errors`) until the process re-sends its manifest.
 //!
 //! The optional `etw.provider.name` attribute uses the configured name, or
 //! the registered-provider name discovered at startup for a GUID-only
-//! subscription. Event-metadata provider-name discovery is not supported yet.
-//! Unregistered GUID-only providers therefore omit this attribute even when
-//! their events contain provider-name metadata. Name lookup failures also
-//! omit the attribute without preventing GUID-based capture.
+//! subscription, or (for EventSource manifest-mode providers) the provider
+//! name from the in-band manifest once it has been received. Other
+//! unregistered GUID-only providers omit this attribute. Name lookup
+//! failures also omit the attribute without preventing GUID-based capture.
 //!
 //! Providers resolved by name from the registered ETW provider database as
 //! manifest providers additionally support `event_ids`, an allow-list of up to
@@ -629,6 +638,8 @@ struct EventCountsDelta {
     total: u64,
     dropped_slow_worker: u64,
     invalid: u64,
+    manifest_events: u64,
+    manifest_errors: u64,
     kernel_events_lost: u64,
     kernel_real_time_buffers_lost: u64,
     kernel_log_buffers_lost: u64,
@@ -645,6 +656,8 @@ impl EventCountsDelta {
         self.total == 0
             && self.dropped_slow_worker == 0
             && self.invalid == 0
+            && self.manifest_events == 0
+            && self.manifest_errors == 0
             && self.kernel_events_lost == 0
             && self.kernel_real_time_buffers_lost == 0
             && self.kernel_log_buffers_lost == 0
@@ -669,6 +682,12 @@ impl EventCountsDelta {
         }
         if self.invalid > 0 {
             metrics.decode.errors.add(self.invalid);
+        }
+        if self.manifest_events > 0 {
+            metrics.decode.manifest_events.add(self.manifest_events);
+        }
+        if self.manifest_errors > 0 {
+            metrics.decode.manifest_errors.add(self.manifest_errors);
         }
         if self.kernel_events_lost > 0 {
             metrics.session.events_lost.add(self.kernel_events_lost);
@@ -721,6 +740,8 @@ fn take_event_counts(telemetry: &session::SessionWideMetrics) -> EventCountsDelt
         total: telemetry.total.swap(0, Ordering::Relaxed),
         dropped_slow_worker: claim_if_nonzero(&telemetry.dropped_slow_worker),
         invalid: claim_if_nonzero(&telemetry.decode_failed),
+        manifest_events: claim_if_nonzero(&telemetry.manifest_events),
+        manifest_errors: claim_if_nonzero(&telemetry.manifest_errors),
         kernel_events_lost: claim_if_nonzero(&telemetry.kernel_events_lost),
         kernel_real_time_buffers_lost: claim_if_nonzero(&telemetry.kernel_real_time_buffers_lost),
         kernel_log_buffers_lost: claim_if_nonzero(&telemetry.kernel_log_buffers_lost),
@@ -1400,6 +1421,39 @@ mod tests {
             3
         );
         assert_eq!(metrics.decode.errors.get(), 2);
+    }
+
+    /// Scenario: EventSource manifest chunks were consumed as metadata, and
+    /// some manifest ingestion problems were reported.
+    /// Guarantees: Both counters are claimed exactly once, land in the decode
+    /// metric set, and do not inflate `events.received` or `decode.errors`.
+    #[test]
+    fn take_event_counts_claims_manifest_counters_outside_ingress() {
+        let telemetry = SessionWideMetrics::default();
+        let _ = telemetry.total.fetch_add(4, Ordering::Relaxed);
+        let _ = telemetry.manifest_events.fetch_add(6, Ordering::Relaxed);
+        let _ = telemetry.manifest_errors.fetch_add(1, Ordering::Relaxed);
+
+        let deltas = take_event_counts(&telemetry);
+        assert_eq!(
+            deltas,
+            EventCountsDelta {
+                total: 4,
+                manifest_events: 6,
+                manifest_errors: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(telemetry.manifest_events.load(Ordering::Relaxed), 0);
+        assert_eq!(telemetry.manifest_errors.load(Ordering::Relaxed), 0);
+        assert!(take_event_counts(&telemetry).is_empty());
+
+        let mut metrics = EtwReceiverMetrics::new_test();
+        deltas.apply(&mut metrics);
+        assert_eq!(metrics.events.received.get(), 4);
+        assert_eq!(metrics.decode.errors.get(), 0);
+        assert_eq!(metrics.decode.manifest_events.get(), 6);
+        assert_eq!(metrics.decode.manifest_errors.get(), 1);
     }
 
     /// Scenario: Claiming kernel trace stats updates event loss and buffer metrics.

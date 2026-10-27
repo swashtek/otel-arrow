@@ -7121,9 +7121,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "one_collect"
-version = "0.1.35021"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef4d6f315e17ea507d6ec71df99775ba247d342a9a1693b1672efc8d9c5e1382"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7131,6 +7129,7 @@ dependencies = [
  "flate2",
  "libc",
  "protobuf",
+ "quick-xml 0.41.0",
  "rhai",
  "rustc-demangle",
  "sha1 0.10.7",

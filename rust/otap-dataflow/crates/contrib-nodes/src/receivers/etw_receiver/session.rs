@@ -36,13 +36,21 @@
 //!
 //! ## TDH Decoding
 //!
-//! For TraceLogging and TraceLoggingDynamic events the callback uses
-//! [`one_collect::etw::tdh::TdhDecoder`] to discover the event schema at
-//! runtime via the Windows TDH APIs.  The decoder maintains a schema cache
-//! so that repeated events with the same layout avoid kernel transitions.
+//! The callback uses [`one_collect::etw::tdh::TdhDecoder`] to discover each
+//! event's schema at runtime: TraceLogging / TraceLoggingDynamic events from
+//! their inline metadata, OS-registered manifest events via the Windows TDH
+//! APIs, and .NET `EventSource` (manifest mode) events from the manifest the
+//! provider emits in-band.  The decoder maintains a schema cache so that
+//! repeated events with the same layout avoid kernel transitions.
 //! Each field's bytes are interpreted into a typed [`EtwAttributeValue`]
 //! (see [`interpret_field_value`]) and stored in a [`DecodedField`], which is
 //! sent across the channel alongside the event header metadata.
+//!
+//! EventSource in-band manifest chunk events are schema metadata: they are
+//! consumed by the decoder, counted in `receiver.etw.decode.manifest.events`,
+//! and never forwarded as log records.  Because decoding happens here on the
+//! single `ProcessTrace` thread before the per-core fan-out, the manifest
+//! state is shared by every core.
 //!
 //! ## Lifecycle
 //!
@@ -64,7 +72,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use one_collect::etw::tdh::TdhDecoder;
+use one_collect::etw::tdh::{TdhDecodeError, TdhDecoder};
 use one_collect::etw::{
     self, EtwSession, ProviderSchemaSource, RegisteredProvider, for_each_registered_provider,
 };
@@ -270,14 +278,14 @@ impl std::fmt::Display for CanonicalGuid {
 pub struct EtwEventData {
     /// Provider GUID that produced the event, in canonical byte order.
     pub provider_id: CanonicalGuid,
-    /// Best-effort provider name resolved once during session startup.
+    /// Best-effort provider name.
     ///
     /// The configured name takes precedence. GUID-only providers use the
-    /// registered-provider database when available; unregistered providers or
-    /// lookup failures leave this as `None`. The owned string avoids a shared
-    /// cross-core reference count at the cost of one allocation and copy per
-    /// named event. Event-metadata provider names are not discovered yet; a
-    /// startup lookup miss remains `None` even if later events contain a name.
+    /// registered-provider database when available, otherwise the name from
+    /// event metadata once it is known (currently the `<provider name>` of an
+    /// EventSource in-band manifest); otherwise `None`. The owned string
+    /// avoids a shared cross-core reference count at the cost of one
+    /// allocation and copy per named event.
     pub provider_name: Option<String>,
     /// ETW event timestamp converted to Unix epoch nanoseconds.
     ///
@@ -949,9 +957,10 @@ fn decode_utf16le(data: &[u8]) -> String {
 /// `UserData`) is still valid. `fields_with_data` reads only within the payload
 /// slice and yields an empty slice for any field (and all following) whose
 /// length can't be resolved. It cannot panic here because TDH emits only
-/// fixed / string / counted-array layouts, never the `__rel_loc`/`__data_loc`
-/// types that hit `todo!()` in `get_data_with_offset_direct`. So no
-/// `catch_unwind` is needed in this `extern "system"` callback.
+/// fixed / string / counted-array (u16- or u32-length-prefixed) layouts, never
+/// the `__rel_loc`/`__data_loc` types that hit `todo!()` in
+/// `get_data_with_offset_direct`. So no `catch_unwind` is needed in this
+/// `extern "system"` callback.
 fn extract_decoded_fields(
     format: &one_collect::event::EventFormat,
     event_data: &[u8],
@@ -965,7 +974,16 @@ fn extract_decoded_fields(
         .collect()
 }
 
-// -- Per-session telemetry bridge ---------------------------------------------
+/// Returns `true` for the decode outcome of an EventSource in-band manifest
+/// chunk event: schema metadata that must not be forwarded as a log record or
+/// counted as a decode failure.
+///
+/// one_collect reports every reserved-descriptor manifest event this way,
+/// including chunks it could not ingest, so this single check drops all
+/// manifest metadata.
+fn is_manifest_metadata_error(error: &TdhDecodeError) -> bool {
+    matches!(error, TdhDecodeError::InbandManifest)
+}
 
 /// Counters written by the `!Send` `ProcessTrace` callback and read by the
 /// async per-core receivers.
@@ -993,6 +1011,14 @@ pub(super) struct SessionWideMetrics {
     pub dropped_slow_worker: AtomicU64,
     /// Events whose TDH decode failed (`receiver.etw.decode.errors`).
     pub decode_failed: AtomicU64,
+    /// EventSource in-band manifest chunk events consumed as schema metadata
+    /// and therefore *not* forwarded (`receiver.etw.decode.manifest.events`).
+    /// Not part of `total`.
+    pub manifest_events: AtomicU64,
+    /// EventSource manifest ingestion problems reported by the decoder
+    /// (invalid envelopes, malformed manifests, orphan chunks, abandoned
+    /// partial manifests) (`receiver.etw.decode.manifest.errors`).
+    pub manifest_errors: AtomicU64,
     /// Kernel-side ETW events lost (buffer overrun) before `one_collect` ever
     /// saw them, from `TraceStats::events_lost`. A background poller converts
     /// the cumulative session counter into per-interval deltas and
@@ -1295,6 +1321,9 @@ fn spawn_etw_session(
             // All callbacks run on the single ProcessTrace thread, so
             // Rc<RefCell<>> is safe (no cross-thread access).
             let decoder: Rc<RefCell<TdhDecoder>> = Rc::new(RefCell::new(TdhDecoder::new()));
+            // Last observed cumulative `InbandManifestStats::ingest_errors()`
+            // of the shared decoder, so each callback publishes only the delta.
+            let manifest_errors_seen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
             // Capture QPC reference point for timestamp conversion.
             // This is done on the session thread just before parse_until
@@ -1321,8 +1350,13 @@ fn spawn_etw_session(
                 let closed_logged = Rc::clone(&closed_logged);
                 let txs = Rc::clone(&txs);
                 let decoder = Rc::clone(&decoder);
+                let manifest_errors_seen = Rc::clone(&manifest_errors_seen);
                 let telemetry = Arc::clone(&telemetry);
                 let provider_name = provider_name.clone();
+                // Provider name learned from event metadata (EventSource
+                // in-band manifests) when neither config nor the startup
+                // lookup supplied one. Per provider callback; set once.
+                let discovered_provider_name: RefCell<Option<String>> = RefCell::new(None);
 
                 wide_event.add_callback(move |_event_data| {
                     // Read header metadata from AncillaryData (populated
@@ -1347,6 +1381,7 @@ fn spawn_etw_session(
                     let mut activity_id = CanonicalGuid::default();
                     let mut event_name = String::new();
                     let mut decoded_fields = Vec::new();
+                    let mut is_manifest_metadata = false;
 
                     if let Some(record) = anc.record() {
                         level = record.EventHeader.EventDescriptor.Level;
@@ -1363,36 +1398,49 @@ fn spawn_etw_session(
                         activity_id =
                             CanonicalGuid::from_guid_parts(g.data1, g.data2, g.data3, g.data4);
 
-                        // TDH decode: attempt to decode TraceLogging event
-                        // schema.  A failure (NotFound for manifest-based
-                        // events, or other decode errors) leaves the empty
-                        // defaults in place and is counted via
-                        // `decode.errors` (`receiver.etw.decode.errors`) - the event is still
-                        // forwarded with empty `decoded_fields`.  Future work
-                        // will add manifest decoding with a
-                        // (Provider, Id, Version) cache key.
+                        // TDH decode: discover the event schema (TraceLogging,
+                        // OS-registered manifest, or EventSource in-band
+                        // manifest).  EventSource manifest-chunk events are
+                        // schema metadata: they are counted and *not*
+                        // forwarded (handled after this block).  Any other
+                        // failure (e.g. NotFound for an unregistered manifest,
+                        // or an EventSource event that arrived before its
+                        // manifest) leaves the empty defaults in place and is
+                        // counted via `decode.errors`
+                        // (`receiver.etw.decode.errors`) - the event is still
+                        // forwarded with empty `decoded_fields`.
                         match decoder.borrow_mut().decode(record) {
                             Ok(result) => {
-                                // TODO(etw-provider-name-metadata): Extend one_collect's
-                                // CachedSchema to extract TRACE_EVENT_INFO.ProviderNameOffset
-                                // and expose the cached optional name in TdhDecodedEvent.
-                                // When no configured/startup name exists, retain that name
-                                // in this provider's callback for subsequent events. Reuse
-                                // schema discovery; do not add per-event OS lookups.
-                                // Cover GUID-only TraceLogging, absent/invalid offsets,
+                                // TODO(etw-provider-name-metadata): one_collect only
+                                // exposes `provider_name` for EventSource in-band
+                                // manifests today. Extend it to TraceLogging
+                                // (TRACE_EVENT_INFO.ProviderNameOffset) and cover
+                                // GUID-only TraceLogging, absent/invalid offsets,
                                 // cache reuse, and configured/startup-name precedence.
+                                if provider_name.is_none()
+                                    && let Some(name) = result.provider_name
+                                {
+                                    let mut discovered = discovered_provider_name.borrow_mut();
+                                    if discovered.is_none() {
+                                        *discovered = Some(name.to_owned());
+                                    }
+                                }
                                 event_name = result.event_name.unwrap_or("").to_owned();
                                 decoded_fields = extract_decoded_fields(
                                     result.event_data.format(),
                                     result.event_data.event_data(),
                                 );
                             }
+                            Err(e) if is_manifest_metadata_error(&e) => {
+                                is_manifest_metadata = true;
+                            }
                             Err(e) => {
                                 let _ = telemetry.decode_failed.fetch_add(1, Ordering::Relaxed);
                                 // Per-event diagnostic at DEBUG (suppressed at the
                                 // default `info` log level). `NotFound` is expected
-                                // for unregistered-manifest, EventSource in-band, and
-                                // opaque events (e.g. EventWriteString);
+                                // for unregistered-manifest events, EventSource events
+                                // that precede their in-band manifest, and opaque
+                                // events (e.g. EventWriteString);
                                 // `Malformed`/`Win32` signal a truncated payload or a
                                 // real TDH failure.
                                 otel_debug!(
@@ -1407,13 +1455,38 @@ fn spawn_etw_session(
                         }
                     }
 
+                    // Publish any new manifest ingestion errors. Checked on
+                    // every event (a cheap `Copy` snapshot), not only on
+                    // manifest chunks: a partial manifest that lost a chunk is
+                    // expired by the decoder's periodic sweep, which runs on
+                    // ordinary events, and often no later chunk arrives.
+                    let errors = decoder.borrow().inband_manifest_stats().ingest_errors();
+                    let previous = manifest_errors_seen.replace(errors);
+                    if errors > previous {
+                        let _ = telemetry
+                            .manifest_errors
+                            .fetch_add(errors - previous, Ordering::Relaxed);
+                    }
+
+                    if is_manifest_metadata {
+                        // EventSource in-band manifest chunk: consumed by the
+                        // decoder as schema metadata, so it is neither a log
+                        // record nor a decode failure. Excluded from
+                        // `events.received` to keep the counter algebra exact.
+                        let _ = telemetry.manifest_events.fetch_add(1, Ordering::Relaxed);
+                        drop(anc);
+                        return Ok(());
+                    }
+
                     // Build EtwEventData with all available metadata.
                     // Convert QPC ticks to Unix epoch nanoseconds.
                     let qpc_ticks = anc.time();
                     let unix_ns = qpc_ref.qpc_to_unix_ns(qpc_ticks);
                     let data = EtwEventData {
                         provider_id: CanonicalGuid::from(anc.provider()),
-                        provider_name: provider_name.clone(),
+                        provider_name: provider_name
+                            .clone()
+                            .or_else(|| discovered_provider_name.borrow().clone()),
                         timestamp: unix_ns as u64,
                         process_id: anc.pid(),
                         thread_id: anc.tid(),
@@ -2749,6 +2822,65 @@ mod tests {
         assert_eq!(fields[0].value, EtwAttributeValue::Str("hello".to_string()));
         assert_eq!(fields[1].name, "n");
         assert_eq!(fields[1].value, EtwAttributeValue::Int(123));
+    }
+
+    #[test]
+    fn extract_handles_eventsource_byte_array() {
+        // EventSource `byte[]` arguments decode (via one_collect's in-band
+        // manifest path) to a `binary` field with a u32 length prefix. The
+        // prefix is consumed by the framework, the bytes surface as
+        // `EtwAttributeValue::Bytes`, and the following field stays aligned.
+        use one_collect::event::{EventField, EventFormat, LocationType};
+
+        let mut format = EventFormat::new();
+        format.add_field(EventField::new(
+            "before".to_string(),
+            "s32".to_string(),
+            LocationType::Static,
+            0,
+            4,
+        ));
+        format.add_field(EventField::new(
+            "data".to_string(),
+            "binary".to_string(),
+            LocationType::StaticLenPrefix32Array,
+            4,
+            0,
+        ));
+        format.add_field(EventField::new(
+            "after".to_string(),
+            "s32".to_string(),
+            LocationType::Static,
+            0,
+            4,
+        ));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&7i32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        data.extend_from_slice(&9i32.to_le_bytes());
+
+        let fields = extract_decoded_fields(&format, &data);
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].value, EtwAttributeValue::Int(7));
+        assert_eq!(
+            fields[1].value,
+            EtwAttributeValue::Bytes(vec![0xAA, 0xBB, 0xCC])
+        );
+        assert_eq!(fields[2].value, EtwAttributeValue::Int(9));
+    }
+
+    #[test]
+    fn only_inband_manifest_outcome_is_metadata() {
+        // Manifest chunks are dropped as metadata; every other decode
+        // failure is still forwarded and counted as a decode error.
+        assert!(is_manifest_metadata_error(&TdhDecodeError::InbandManifest));
+        assert!(!is_manifest_metadata_error(&TdhDecodeError::NotFound));
+        assert!(!is_manifest_metadata_error(&TdhDecodeError::Unsupported));
+        assert!(!is_manifest_metadata_error(&TdhDecodeError::Malformed("x")));
+        assert!(!is_manifest_metadata_error(&TdhDecodeError::Win32(5)));
     }
 
     // -- Trace-stats poller edge cases --------------
