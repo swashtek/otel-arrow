@@ -1,0 +1,13 @@
+# Idle State Performance Test (Windows) - Single Core, 60 s observation window
+# Experiment config: same as continuous/idle-state-windows-docker.yaml but with
+# a longer observation window, to compare CPU and memory stability.
+from_template:
+  path: test_suites/integration/continuous/idle-state-template.yaml.j2
+  variables:
+    platform: windows
+    core_label: "Single Core 60s"
+    core_range: "0-0"
+    allocated_cores: 1
+    port: 8086
+    result_subdir: "1core_60s"
+    observe_seconds: 60

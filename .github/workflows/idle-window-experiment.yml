@@ -1,0 +1,86 @@
+# Temporary experiment for open-telemetry/otel-arrow#4084: compare idle CPU and
+# memory stability for 15 s, 60 s, and 120 s observation windows on the same
+# hosted Windows runner. Not intended to be merged.
+name: Idle window experiment (Windows)
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [winperf-idle-window-experiment]
+  workflow_dispatch:
+
+jobs:
+  idle-window-experiment:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Free disk space
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\Android") { Remove-Item -Recurse -Force "C:\Android" }
+          if (Test-Path "C:\SeleniumWebDrivers") { Remove-Item -Recurse -Force "C:\SeleniumWebDrivers" }
+          if (Test-Path "C:\imagemagick") { Remove-Item -Recurse -Force "C:\imagemagick" }
+
+      - name: Set up protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start Docker service
+        shell: pwsh
+        run: |
+          Start-Service docker
+          docker info
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+
+      - name: Build df_engine.exe
+        shell: pwsh
+        working-directory: ./rust/otap-dataflow
+        run: cargo build --release --no-default-features --features mimalloc,crypto-ring,dev-tools,core-nodes
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Build Windows Docker image
+        shell: pwsh
+        working-directory: ./rust/otap-dataflow
+        run: docker build -f Dockerfile.windows -t df_engine_win .
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --user --require-hashes -r tools/pipeline_perf_test/orchestrator/requirements.lock.txt
+          python -m pip install --user --require-hashes -r tools/pipeline_perf_test/load_generator/requirements.lock.txt
+
+      - name: Run interleaved observation window experiment
+        shell: pwsh
+        working-directory: ./tools/pipeline_perf_test
+        env:
+          PYTHONUTF8: "1"
+        run: >-
+          python scripts/run_idle_window_experiment.py
+          --rounds 5 --warmup-rounds 1
+          --output-dir results/window_experiment
+          --window 15s test_suites/integration/continuous/idle-state-windows-docker.yaml results/windows_idle_state_1core/gh-actions-benchmark
+          --window 60s test_suites/integration/experiments/idle-state-windows-60s-docker.yaml results/windows_idle_state_1core_60s/gh-actions-benchmark
+          --window 120s test_suites/integration/experiments/idle-state-windows-120s-docker.yaml results/windows_idle_state_1core_120s/gh-actions-benchmark
+
+      - name: Upload experiment results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idle-window-experiment
+          path: tools/pipeline_perf_test/results/window_experiment/**

@@ -82,7 +82,7 @@ tests:
       - name: Observe Idle State
         action:
           wait:
-            delay_seconds: 15
+            delay_seconds: {{ observe_seconds | default(15) }}
         hooks:
           run:
             pre:
